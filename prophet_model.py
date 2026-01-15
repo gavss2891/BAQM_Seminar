@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from prophet import Prophet
 from pathlib import Path
 from dataclasses import dataclass
@@ -11,20 +10,19 @@ import multiprocessing
 @dataclass
 class Config:
     base_dir: Path = Path.cwd() / 'data' / 'merged_data'
-    forecast_horizon: int = 31
-    lags: tuple = (1, 2, 3) 
-    leads: tuple = (1,)
+    output_dir: Path = Path.cwd() / 'data' / 'forecasts'
     
-    # Custom Split Dates
-    train_cutoff_date: str = '2023-10-31'
-    validation_cutoff_date: str = '2023-11-30'
-
+    # Lags/Leads
+    lags: tuple = () 
+    leads: tuple = ()
+    
     @property
     def train_path(self):
         return self.base_dir / 'master_train.csv'
     
     @property
     def forecast_path(self):
+        # This file serves as both input features AND the output template
         return self.base_dir / 'master_forecast.csv'
 
 # --- 2. The Forecaster Engine ---
@@ -35,12 +33,19 @@ class ProphetForecaster:
         self.df_future_raw = None
 
     def load_data(self):
-        """Loads raw CSVs into memory once."""
-        def _read(path):
+        """Loads raw CSVs into memory."""
+        def _read(path, sep=','):
             if not path.exists():
-                return self._generate_dummy_data()
+                print(f"File not found: {path}")
+                return pd.DataFrame()
             print(f"Loading {path.name}...")
-            df = pd.read_csv(path, low_memory=False)
+            # Try reading with default comma, fallback or adjust if your master_forecast is actually semicolon
+            # Based on previous context, merged_data usually uses comma, but we can be robust.
+            try:
+                df = pd.read_csv(path, sep=sep, low_memory=False)
+            except:
+                df = pd.read_csv(path, sep=';', low_memory=False)
+                
             df['date'] = pd.to_datetime(df['date'])
             return df.replace('NaN', np.nan).fillna(0)
 
@@ -48,38 +53,10 @@ class ProphetForecaster:
         self.df_future_raw = _read(self.cfg.forecast_path)
         print("Data loaded successfully.\n")
 
-    def _generate_dummy_data(self):
-        dates = pd.date_range(start='2023-01-01', end='2023-12-31', freq='D')
-        data = []
-        for i in range(10): # Increased dummy data for parallel demo
-            art_id = f"article_{i}"
-            df = pd.DataFrame({
-                'date': dates,
-                'articleId': art_id,
-                'sales_volume_index': np.random.randint(10, 100, len(dates)),
-                'discountPct': np.random.choice([0, 0.1, 0.2], len(dates))
-            })
-            data.append(df)
-        return pd.concat(data)
-
-    @staticmethod
-    def calculate_smape(y_true, y_pred):
-        y_true, y_pred = np.array(y_true), np.array(y_pred)
-        numerator = np.abs(y_pred - y_true)
-        denominator = np.abs(y_pred) + np.abs(y_true)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            smape = numerator / denominator
-            smape[denominator == 0] = 0.0
-        return 2 * np.mean(smape)
-
     @staticmethod
     def _process_single_article(article_id, df_train_sub, df_future_sub, cfg):
-        """
-        Worker function that runs in a separate process.
-        It is static and self-contained to avoid pickling the whole class instance.
-        """
         try:
-            # --- A. Preprocessing ---
+            # --- A. Setup ---
             train = df_train_sub.copy()
             future = df_future_sub.copy()
             
@@ -88,12 +65,16 @@ class ProphetForecaster:
             train.rename(columns={'date': 'ds', 'sales_volume_index': 'y'}, inplace=True)
             future.rename(columns={'date': 'ds'}, inplace=True)
 
-            # Log Transform
+            train['is_train'] = True
+            future['is_train'] = False
+
+            # Log Transform Target
             train['y'] = np.log1p(train['y'])
 
-            # Unified Timeline
-            cols = ['ds', 'discountPct']
-            timeline = pd.concat([train[cols], future[cols]]).sort_values('ds').drop_duplicates('ds').reset_index(drop=True)
+            # --- B. Feature Engineering ---
+            cols_needed = ['ds', 'discountPct', 'is_train']
+            timeline = pd.concat([train[cols_needed], future[cols_needed]]).sort_values('ds').reset_index(drop=True)
+            
             timeline['is_discounted'] = (timeline['discountPct'] > 0).astype(int)
             regressor_names = ['is_discounted']
 
@@ -107,112 +88,122 @@ class ProphetForecaster:
                 timeline[col_name] = timeline['is_discounted'].shift(-lead).fillna(0)
                 regressor_names.append(col_name)
 
-            train_final = pd.merge(train[['ds', 'y']], timeline, on='ds', how='left')
+            # --- C. Split ---
+            train_features = timeline[timeline['is_train'] == True].drop(columns=['is_train'])
+            train_final = pd.merge(train[['ds', 'y']], train_features, on='ds', how='left')
 
-            # --- B. Evaluation (Train/Test Split) ---
-            train_cutoff = pd.to_datetime(cfg.train_cutoff_date)
-            valid_cutoff = pd.to_datetime(cfg.validation_cutoff_date)
+            future_final = timeline[timeline['is_train'] == False].drop(columns=['is_train'])
             
-            df = train_final.sort_values('ds').reset_index(drop=True)
-            train_df = df[df['ds'] <= train_cutoff].copy()
-            valid_df = df[(df['ds'] > train_cutoff) & (df['ds'] <= valid_cutoff)].copy()
-            
-            if len(train_df) < 10 or len(valid_df) == 0:
+            if len(train_final) < 5 or future_final.empty:
                 return None
 
-            # Train
+            # --- D. Modeling ---
             m = Prophet(seasonality_mode='additive', yearly_seasonality=True)
             for reg in regressor_names:
                 m.add_regressor(reg)
-            m.fit(train_df)
             
-            # Predict
-            forecast = m.predict(valid_df.drop(columns='y'))
+            m.fit(train_final)
             
-            # Inverse Transform
-            y_true = np.expm1(valid_df['y'].values)
-            y_pred = np.expm1(forecast['yhat'].values)
+            # --- E. Prediction ---
+            forecast = m.predict(future_final)
+            forecast_values = np.expm1(forecast['yhat'].values)
             
-            # Calculate Metric
-            smape = ProphetForecaster.calculate_smape(y_true, y_pred)
-            
-            # Return detailed results
+            # Return just the keys and prediction
             result_df = pd.DataFrame({
                 'articleId': article_id,
-                'date': valid_df['ds'].values,
-                'actual_sales': y_true,
-                'predicted_sales': y_pred,
-                'diff': y_pred - y_true
+                'date': future_final['ds'].values,
+                'predicted_sales': forecast_values
             })
             
-            return (article_id, smape, result_df)
+            return result_df
 
-        except Exception as e:
-            # Catch errors in worker to prevent crash
-            print(f"Error processing {article_id}: {e}")
+        except Exception:
             return None
 
-    def run_batch_evaluation(self, n_jobs=-1):
-        """
-        Runs evaluation in parallel.
-        n_jobs=-1 uses all available cores.
-        """
-        unique_articles = self.df_train_raw['articleId'].unique()
-        cpu_count = multiprocessing.cpu_count()
-        n_jobs = cpu_count if n_jobs == -1 else n_jobs
+    def run_production_forecast(self, n_jobs=-1):
+        unique_articles = self.df_future_raw['articleId'].unique()
+        n_jobs = multiprocessing.cpu_count() if n_jobs == -1 else n_jobs
         
-        print(f"--- Starting Parallel Evaluation ---")
-        print(f"Articles: {len(unique_articles)} | Cores: {n_jobs}")
-        
+        print(f"--- Starting Production Forecast ---")
+        print(f"Target Articles: {len(unique_articles)} | Cores: {n_jobs}")
 
-        # Prepare arguments for each task
-        # We group the data by articleId first to avoid passing the giant dataframe to every worker
         grouped_train = self.df_train_raw.groupby('articleId')
         grouped_future = self.df_future_raw.groupby('articleId')
         
         tasks = []
         for art_id in unique_articles:
-            # Extract only relevant data for this article
-            try:
-                t_sub = grouped_train.get_group(art_id)
-                f_sub = grouped_future.get_group(art_id) if art_id in grouped_future.groups else pd.DataFrame(columns=['date', 'articleId', 'discountPct'])
-                tasks.append((art_id, t_sub, f_sub, self.cfg))
-            except KeyError:
-                continue
+            if art_id in grouped_train.groups:
+                tasks.append((art_id, grouped_train.get_group(art_id), grouped_future.get_group(art_id), self.cfg))
 
-        # Execute Parallel Loop
         results = Parallel(n_jobs=n_jobs, verbose=5)(
             delayed(self._process_single_article)(art_id, t, f, c) 
             for art_id, t, f, c in tasks
         )
 
-        # Process Results
-        metrics_list = []
-        all_preds_list = []
+        final_dfs = [res for res in results if res is not None]
+        
+        if not final_dfs:
+            return pd.DataFrame()
 
-        for res in results:
-            if res is None: continue
-            art_id, smape, preds_df = res
-            metrics_list.append({'articleId': art_id, 'sMAPE': smape})
-            all_preds_list.append(preds_df)
-
-        metrics_df = pd.DataFrame(metrics_list)
-        predictions_df = pd.concat(all_preds_list, ignore_index=True) if all_preds_list else pd.DataFrame()
-
-        print("\n--- Batch Complete ---")
-        if not metrics_df.empty:
-            print(f"Global Mean sMAPE: {metrics_df['sMAPE'].mean():.4f}")
-
-        return metrics_df, predictions_df
+        return pd.concat(final_dfs, ignore_index=True)
 
 # --- 3. Execution ---
 if __name__ == "__main__":
-    config = Config(train_cutoff_date='2024-10-31', validation_cutoff_date='2024-11-30')
+    config = Config()
     forecaster = ProphetForecaster(config)
+    
+    # 1. Load Data
     forecaster.load_data()
     
-    # Run Parallel
-    smape_summary, detailed_forecasts = forecaster.run_batch_evaluation(n_jobs=-1)
+    # 2. Run Forecast
+    predictions = forecaster.run_production_forecast(n_jobs=-1)
     
-    print("\n--- Summary ---")
-    print(smape_summary.head())
+    # 3. Load Template (master_forecast.csv)
+    # We reload it to ensure we have the pristine structure/columns
+    print(f"Loading template: {config.forecast_path.name}")
+    # Adjust separator if your master_forecast uses semicolons, otherwise default to comma
+    try:
+        df_template = pd.read_csv(config.forecast_path, sep=',', low_memory=False)
+        if len(df_template.columns) <= 1: # check if parsing failed
+             df_template = pd.read_csv(config.forecast_path, sep=';', low_memory=False)
+    except:
+        df_template = pd.read_csv(config.forecast_path, sep=',', low_memory=False)
+
+    # Standardise dates for merging
+    df_template['date_parsed'] = pd.to_datetime(df_template['date'])
+    predictions['date'] = pd.to_datetime(predictions['date'])
+    
+    # 4. Merge Predictions into Template
+    # Left join to keep all rows in master_forecast (even those without predictions)
+    df_merged = pd.merge(
+        df_template, 
+        predictions, 
+        left_on=['articleId', 'date_parsed'], 
+        right_on=['articleId', 'date'], 
+        how='left'
+    )
+    
+    # 5. Overwrite/Fill 'sales_volume_index'
+    # If sales_volume_index already existed (e.g. as 0 or NaN), we update it.
+    # We use fillna(0) for missing predictions.
+    df_merged['sales_volume_index'] = df_merged['predicted_sales'].fillna(0)
+    
+    # 6. Cleanup & Export
+    # Drop the temporary merge columns
+    cols_to_drop = ['date_parsed', 'predicted_sales']
+    # If the merge created a duplicate 'date' column (date_y), drop it too
+    if 'date_y' in df_merged.columns:
+        cols_to_drop.append('date_y')
+        df_merged.rename(columns={'date_x': 'date'}, inplace=True)
+    
+    final_output = df_merged[['date', 'articleId', 'storeCount', 'FSC_index', 'sales_volume_index', 'promo_id']]
+    
+    # Ensure Output Directory
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = config.output_dir / 'prophet_predictions.csv'
+    
+    # Write to CSV
+    final_output.to_csv(output_path, sep=';', index=False)
+    
+    print(f"Saved to: {output_path}")
+    print(final_output.head())

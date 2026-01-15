@@ -9,12 +9,13 @@ import multiprocessing
 # --- 1. Configuration Class ---
 @dataclass
 class Config:
+    # Adjusted base directory to align with common project structures if needed
     base_dir: Path = Path.cwd() / 'data' / 'merged_data'
     output_dir: Path = Path.cwd() / 'data' / 'forecasts'
     
     # Lags/Leads
-    lags: tuple = () 
-    leads: tuple = ()
+    lags: tuple = (1, 2, 3,) 
+    leads: tuple = (1,)
     
     @property
     def train_path(self):
@@ -22,7 +23,6 @@ class Config:
     
     @property
     def forecast_path(self):
-        # This file serves as both input features AND the output template
         return self.base_dir / 'master_forecast.csv'
 
 # --- 2. The Forecaster Engine ---
@@ -34,18 +34,13 @@ class ProphetForecaster:
 
     def load_data(self):
         """Loads raw CSVs into memory."""
-        def _read(path, sep=','):
+        def _read(path):
             if not path.exists():
                 print(f"File not found: {path}")
                 return pd.DataFrame()
             print(f"Loading {path.name}...")
-            # Try reading with default comma, fallback or adjust if your master_forecast is actually semicolon
-            # Based on previous context, merged_data usually uses comma, but we can be robust.
-            try:
-                df = pd.read_csv(path, sep=sep, low_memory=False)
-            except:
-                df = pd.read_csv(path, sep=';', low_memory=False)
-                
+            # Ensure proper reading if input files also vary in format
+            df = pd.read_csv(path, low_memory=False) 
             df['date'] = pd.to_datetime(df['date'])
             return df.replace('NaN', np.nan).fillna(0)
 
@@ -53,8 +48,30 @@ class ProphetForecaster:
         self.df_future_raw = _read(self.cfg.forecast_path)
         print("Data loaded successfully.\n")
 
+
+    @staticmethod
+    def calculate_smape(y_true, y_pred):
+        """
+        Calculates sMAPE based on the provided formula:
+        sMAPE = 2/N * sum( |F - A| / (|F| + |A|) )
+        """
+        y_true = np.array(y_true)
+        y_pred = np.array(y_pred)
+        
+        numerator = np.abs(y_pred - y_true)
+        denominator = np.abs(y_pred) + np.abs(y_true)
+        
+        # Handle division by zero where both forecast and actual are 0
+        # If denominator is 0, the ratio is defined as 0 for this metric
+        ratio = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)
+        
+        return 2 * np.mean(ratio)
+
     @staticmethod
     def _process_single_article(article_id, df_train_sub, df_future_sub, cfg):
+        """
+        Trains on ALL history provided. Predicts on the future file provided.
+        """
         try:
             # --- A. Setup ---
             train = df_train_sub.copy()
@@ -71,24 +88,39 @@ class ProphetForecaster:
             # Log Transform Target
             train['y'] = np.log1p(train['y'])
 
-            # --- B. Feature Engineering ---
-            cols_needed = ['ds', 'discountPct', 'is_train']
+            # --- B. Feature Engineering (Unified Timeline) ---
+            reserved_cols = ['ds', 'y', 'articleId', 'is_train']
+            available_cols = train.columns.tolist()
+
+            potential_regressors = [
+                c for c in available_cols 
+                if c not in reserved_cols 
+                and pd.api.types.is_numeric_dtype(train[c])
+            ]
+
+            cols_needed = ['ds', 'is_train'] + potential_regressors            
+            valid_regressors = [c for c in potential_regressors if c in future.columns]
+
+            cols_needed = ['ds', 'is_train'] + valid_regressors
+
             timeline = pd.concat([train[cols_needed], future[cols_needed]]).sort_values('ds').reset_index(drop=True)
-            
-            timeline['is_discounted'] = (timeline['discountPct'] > 0).astype(int)
-            regressor_names = ['is_discounted']
 
+            # Dynamic Regressor List
+            regressor_names = [c for c in cols_needed if c not in ['ds', 'is_train']]
+
+            # Create Lags
             for lag in cfg.lags:
-                col_name = f'is_discounted_lag{lag}'
-                timeline[col_name] = timeline['is_discounted'].shift(lag).fillna(0)
+                col_name = f'discountPct_lag{lag}'
+                timeline[col_name] = timeline['discountPct'].shift(lag).fillna(0)
                 regressor_names.append(col_name)
 
+            # Create Leads
             for lead in cfg.leads:
-                col_name = f'is_discounted_lead{lead}'
-                timeline[col_name] = timeline['is_discounted'].shift(-lead).fillna(0)
+                col_name = f'discountPct_lead{lead}'
+                timeline[col_name] = timeline['discountPct'].shift(-lead).fillna(0)
                 regressor_names.append(col_name)
 
-            # --- C. Split ---
+            # --- C. Split Back to Train/Future ---
             train_features = timeline[timeline['is_train'] == True].drop(columns=['is_train'])
             train_final = pd.merge(train[['ds', 'y']], train_features, on='ds', how='left')
 
@@ -99,6 +131,7 @@ class ProphetForecaster:
 
             # --- D. Modeling ---
             m = Prophet(seasonality_mode='additive', yearly_seasonality=True)
+            
             for reg in regressor_names:
                 m.add_regressor(reg)
             
@@ -106,10 +139,15 @@ class ProphetForecaster:
             
             # --- E. Prediction ---
             forecast = m.predict(future_final)
-            forecast_values = np.expm1(forecast['yhat'].values)
             
-            # Return just the keys and prediction
+            # Inverse Transform
+            forecast_values = np.expm1(forecast['yhat'].values)
+
+            unique_id = future['ds'].astype(str) + future['articleId'].astype(str)
+
+            # Prepare Result
             result_df = pd.DataFrame({
+                'id': unique_id,
                 'articleId': article_id,
                 'date': future_final['ds'].values,
                 'predicted_sales': forecast_values
@@ -117,12 +155,89 @@ class ProphetForecaster:
             
             return result_df
 
-        except Exception:
+        except Exception as e:
+            return None
+        
+
+    def run_validation(self, train_end_date, valid_end_date, n_jobs=-1):
+        """
+        Splits historical data into train/valid sets based on dates,
+        trains the model, predicts on validation set, and calculates sMAPE.
+        """
+        print(f"\n--- Starting Validation ---")
+        print(f"Training Data:   <= {train_end_date}")
+        print(f"Validation Data: > {train_end_date} and <= {valid_end_date}")
+
+        # 1. Filter Data
+        mask_train = self.df_train_raw['date'] <= pd.to_datetime(train_end_date)
+        mask_valid = (self.df_train_raw['date'] > pd.to_datetime(train_end_date)) & \
+                     (self.df_train_raw['date'] <= pd.to_datetime(valid_end_date))
+
+        df_train_sub = self.df_train_raw[mask_train].copy()
+        df_valid_sub = self.df_train_raw[mask_valid].copy()
+
+        if df_train_sub.empty or df_valid_sub.empty:
+            print("Error: Train or Validation set is empty. Check your dates.")
             return None
 
+        # 2. Prepare Parallel Tasks
+        unique_articles = df_valid_sub['articleId'].unique()
+        print(f"Articles to validate: {len(unique_articles)}")
+
+        grouped_train = df_train_sub.groupby('articleId')
+        grouped_valid = df_valid_sub.groupby('articleId')
+
+        tasks = []
+        for art_id in unique_articles:
+            try:
+                # We need history for this article to train
+                t_sub = grouped_train.get_group(art_id)
+                # We need validation targets for this article
+                v_sub = grouped_valid.get_group(art_id)
+                
+                # We pass the validation set (v_sub) as the "future" dataframe
+                tasks.append((art_id, t_sub, v_sub, self.cfg))
+            except KeyError:
+                # If an article is in validation but has no history, we skip it
+                continue
+
+        # 3. Execute Forecasts
+        cpu_count = multiprocessing.cpu_count()
+        n_jobs = cpu_count if n_jobs == -1 else n_jobs
+        
+        results = Parallel(n_jobs=n_jobs, verbose=5)(
+            delayed(self._process_single_article)(art_id, t, f, c) 
+            for art_id, t, f, c in tasks
+        )
+
+        final_dfs = [res for res in results if res is not None]
+
+        if not final_dfs:
+            print("No predictions generated during validation.")
+            return None
+
+        # 4. Consolidate and Score
+        df_preds = pd.concat(final_dfs, ignore_index=True)
+        
+        # Merge predictions with actuals from the validation split
+        # We merge on articleId and date to ensure alignment
+        cols_actuals = ['articleId', 'date', 'sales_volume_index']
+        df_merged = pd.merge(df_valid_sub[cols_actuals], df_preds, on=['articleId', 'date'], how='inner')
+
+        smape_score = self.calculate_smape(df_merged['sales_volume_index'], df_merged['predicted_sales'])
+        
+        print(f"Validation Complete. Processed {len(df_merged)} observations.")
+        print(f"Global sMAPE: {smape_score:.4f}")
+        
+        return smape_score, df_merged        
+
     def run_production_forecast(self, n_jobs=-1):
+        """
+        Runs the forecast generation in parallel.
+        """
         unique_articles = self.df_future_raw['articleId'].unique()
-        n_jobs = multiprocessing.cpu_count() if n_jobs == -1 else n_jobs
+        cpu_count = multiprocessing.cpu_count()
+        n_jobs = cpu_count if n_jobs == -1 else n_jobs
         
         print(f"--- Starting Production Forecast ---")
         print(f"Target Articles: {len(unique_articles)} | Cores: {n_jobs}")
@@ -132,8 +247,12 @@ class ProphetForecaster:
         
         tasks = []
         for art_id in unique_articles:
-            if art_id in grouped_train.groups:
-                tasks.append((art_id, grouped_train.get_group(art_id), grouped_future.get_group(art_id), self.cfg))
+            try:
+                t_sub = grouped_train.get_group(art_id)
+                f_sub = grouped_future.get_group(art_id)
+                tasks.append((art_id, t_sub, f_sub, self.cfg))
+            except KeyError:
+                continue
 
         results = Parallel(n_jobs=n_jobs, verbose=5)(
             delayed(self._process_single_article)(art_id, t, f, c) 
@@ -143,67 +262,24 @@ class ProphetForecaster:
         final_dfs = [res for res in results if res is not None]
         
         if not final_dfs:
+            print("No forecasts generated.")
             return pd.DataFrame()
 
-        return pd.concat(final_dfs, ignore_index=True)
+        master_forecast = pd.concat(final_dfs, ignore_index=True)
+        print(f"\n--- Batch Complete. Generated {len(master_forecast)} rows. ---")
+        
+        return master_forecast
 
 # --- 3. Execution ---
 if __name__ == "__main__":
     config = Config()
-    forecaster = ProphetForecaster(config)
     
-    # 1. Load Data
+    forecaster = ProphetForecaster(config)
     forecaster.load_data()
     
-    # 2. Run Forecast
-    predictions = forecaster.run_production_forecast(n_jobs=-1)
+    # Run Forecast
     
-    # 3. Load Template (master_forecast.csv)
-    # We reload it to ensure we have the pristine structure/columns
-    print(f"Loading template: {config.forecast_path.name}")
-    # Adjust separator if your master_forecast uses semicolons, otherwise default to comma
-    try:
-        df_template = pd.read_csv(config.forecast_path, sep=',', low_memory=False)
-        if len(df_template.columns) <= 1: # check if parsing failed
-             df_template = pd.read_csv(config.forecast_path, sep=';', low_memory=False)
-    except:
-        df_template = pd.read_csv(config.forecast_path, sep=',', low_memory=False)
-
-    # Standardise dates for merging
-    df_template['date_parsed'] = pd.to_datetime(df_template['date'])
-    predictions['date'] = pd.to_datetime(predictions['date'])
+    TRAIN_END = '2023-11-30'
+    VALID_END = '2023-12-31'
     
-    # 4. Merge Predictions into Template
-    # Left join to keep all rows in master_forecast (even those without predictions)
-    df_merged = pd.merge(
-        df_template, 
-        predictions, 
-        left_on=['articleId', 'date_parsed'], 
-        right_on=['articleId', 'date'], 
-        how='left'
-    )
-    
-    # 5. Overwrite/Fill 'sales_volume_index'
-    # If sales_volume_index already existed (e.g. as 0 or NaN), we update it.
-    # We use fillna(0) for missing predictions.
-    df_merged['sales_volume_index'] = df_merged['predicted_sales'].fillna(0)
-    
-    # 6. Cleanup & Export
-    # Drop the temporary merge columns
-    cols_to_drop = ['date_parsed', 'predicted_sales']
-    # If the merge created a duplicate 'date' column (date_y), drop it too
-    if 'date_y' in df_merged.columns:
-        cols_to_drop.append('date_y')
-        df_merged.rename(columns={'date_x': 'date'}, inplace=True)
-    
-    final_output = df_merged[['date', 'articleId', 'storeCount', 'FSC_index', 'sales_volume_index', 'promo_id']]
-    
-    # Ensure Output Directory
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = config.output_dir / 'prophet_predictions.csv'
-    
-    # Write to CSV
-    final_output.to_csv(output_path, sep=';', index=False)
-    
-    print(f"Saved to: {output_path}")
-    print(final_output.head())
+    loss, val_df = forecaster.run_validation(TRAIN_END, VALID_END)

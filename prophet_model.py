@@ -14,8 +14,8 @@ class Config:
     output_dir: Path = Path.cwd() / 'data' / 'forecasts'
     
     # Lags/Leads
-    lags: tuple = (1, 2, 3,) 
-    leads: tuple = (1,)
+    lags: tuple = () 
+    leads: tuple = ()
     
     @property
     def train_path(self):
@@ -89,24 +89,12 @@ class ProphetForecaster:
             train['y'] = np.log1p(train['y'])
 
             # --- B. Feature Engineering (Unified Timeline) ---
-            reserved_cols = ['ds', 'y', 'articleId', 'is_train']
-            available_cols = train.columns.tolist()
-
-            potential_regressors = [
-                c for c in available_cols 
-                if c not in reserved_cols 
-                and pd.api.types.is_numeric_dtype(train[c])
-            ]
-
-            cols_needed = ['ds', 'is_train'] + potential_regressors            
-            valid_regressors = [c for c in potential_regressors if c in future.columns]
-
-            cols_needed = ['ds', 'is_train'] + valid_regressors
-
+            cols_needed = ['ds', 'discountPct', 'is_train','storeCount', 'FSC_index']
+            
             timeline = pd.concat([train[cols_needed], future[cols_needed]]).sort_values('ds').reset_index(drop=True)
-
-            # Dynamic Regressor List
-            regressor_names = [c for c in cols_needed if c not in ['ds', 'is_train']]
+            
+            # Create Base Regressor
+            regressor_names = ['discountPct', 'storeCount', 'FSC_index']
 
             # Create Lags
             for lag in cfg.lags:
